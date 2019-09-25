@@ -17,7 +17,6 @@
 require "digest/md5"
 require "file_utils"
 require "kemal"
-require "markdown"
 require "openssl/hmac"
 require "option_parser"
 require "pg"
@@ -76,6 +75,7 @@ LOCALES = {
   "nl"    => load_locale("nl"),
   "pl"    => load_locale("pl"),
   "ru"    => load_locale("ru"),
+  "tr"    => load_locale("tr"),
   "uk"    => load_locale("uk"),
   "zh-CN" => load_locale("zh-CN"),
 }
@@ -174,7 +174,10 @@ get "/api/v1/storyboards/:id" do |env|
   begin
     video = fetch_video(id, region)
   rescue ex : VideoRedirect
-    next env.redirect "/api/v1/storyboards/#{ex.message}"
+    error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
+    env.response.status_code = 302
+    env.response.headers["Location"] = env.request.resource.gsub(id, ex.video_id)
+    next error_message
   rescue ex
     env.response.status_code = 500
     next
@@ -259,7 +262,10 @@ get "/api/v1/captions/:id" do |env|
   begin
     video = fetch_video(id, region)
   rescue ex : VideoRedirect
-    next env.redirect "/api/v1/captions/#{ex.message}"
+    error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
+    env.response.status_code = 302
+    env.response.headers["Location"] = env.request.resource.gsub(id, ex.video_id)
+    next error_message
   rescue ex
     env.response.status_code = 500
     next
@@ -280,7 +286,7 @@ get "/api/v1/captions/:id" do |env|
               json.object do
                 json.field "label", caption.name.simpleText
                 json.field "languageCode", caption.languageCode
-                json.field "url", "/api/v1/captions/#{id}?label=#{URI.escape(caption.name.simpleText)}"
+                json.field "url", "/api/v1/captions/#{id}?label=#{URI.encode_www_form(caption.name.simpleText)}"
               end
             end
           end
@@ -359,7 +365,7 @@ get "/api/v1/captions/:id" do |env|
 
   if title = env.params.query["title"]?
     # https://blog.fastmail.com/2011/06/24/download-non-english-filenames/
-    env.response.headers["Content-Disposition"] = "attachment; filename=\"#{URI.escape(title)}\"; filename*=UTF-8''#{URI.escape(title)}"
+    env.response.headers["Content-Disposition"] = "attachment; filename=\"#{URI.encode_www_form(title)}\"; filename*=UTF-8''#{URI.encode_www_form(title)}"
   end
 
   webvtt
@@ -544,7 +550,7 @@ get "/api/v1/annotations/:id" do |env|
       id = id.sub(/^-/, 'A')
     end
 
-    file = URI.escape("#{id[0, 3]}/#{id}.xml")
+    file = URI.encode_www_form("#{id[0, 3]}/#{id}.xml")
 
     client = make_client(ARCHIVE_URL)
     location = client.get("/download/youtubeannotations_#{index}/#{id[0, 2]}.tar/#{file}")
@@ -593,7 +599,10 @@ get "/api/v1/videos/:id" do |env|
   begin
     video = fetch_video(id, region)
   rescue ex : VideoRedirect
-    next env.redirect "/api/v1/videos/#{ex.message}"
+    error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
+    env.response.status_code = 302
+    env.response.headers["Location"] = env.request.resource.gsub(id, ex.video_id)
+    next error_message
   rescue ex
     error_message = {"error" => ex.message}.to_json
     env.response.status_code = 500
@@ -641,6 +650,11 @@ get "/api/v1/channels/:ucid" do |env|
 
   begin
     channel = get_about_info(ucid, locale)
+  rescue ex : ChannelRedirect
+    error_message = {"error" => "Channel is unavailable", "authorId" => ex.channel_id}.to_json
+    env.response.status_code = 302
+    env.response.headers["Location"] = env.request.resource.gsub(ucid, ex.channel_id)
+    next error_message
   rescue ex
     error_message = {"error" => ex.message}.to_json
     env.response.status_code = 500
@@ -771,6 +785,11 @@ end
 
     begin
       channel = get_about_info(ucid, locale)
+    rescue ex : ChannelRedirect
+      error_message = {"error" => "Channel is unavailable", "authorId" => ex.channel_id}.to_json
+      env.response.status_code = 302
+      env.response.headers["Location"] = env.request.resource.gsub(ucid, ex.channel_id)
+      next error_message
     rescue ex
       error_message = {"error" => ex.message}.to_json
       env.response.status_code = 500
@@ -835,6 +854,11 @@ end
 
     begin
       channel = get_about_info(ucid, locale)
+    rescue ex : ChannelRedirect
+      error_message = {"error" => "Channel is unavailable", "authorId" => ex.channel_id}.to_json
+      env.response.status_code = 302
+      env.response.headers["Location"] = env.request.resource.gsub(ucid, ex.channel_id)
+      next error_message
     rescue ex
       error_message = {"error" => ex.message}.to_json
       env.response.status_code = 500
@@ -967,7 +991,7 @@ get "/api/v1/search/suggestions" do |env|
 
   begin
     client = make_client(URI.parse("https://suggestqueries.google.com"))
-    response = client.get("/complete/search?hl=en&gl=#{region}&client=youtube&ds=yt&q=#{URI.escape(query)}&callback=suggestCallback").body
+    response = client.get("/complete/search?hl=en&gl=#{region}&client=youtube&ds=yt&q=#{URI.encode_www_form(query)}&callback=suggestCallback").body
 
     body = response[35..-2]
     body = JSON.parse(body).as_a
@@ -1183,11 +1207,7 @@ get "/api/manifest/dash/id/:id" do |env|
   begin
     video = fetch_video(id, region)
   rescue ex : VideoRedirect
-    url = "/api/manifest/dash/id/#{ex.message}"
-    if env.params.query
-      url += "?#{env.params.query}"
-    end
-    next env.redirect url
+    next env.redirect env.request.resource.gsub(id, ex.video_id)
   rescue ex
     env.response.status_code = 403
     next
@@ -1354,7 +1374,7 @@ get "/api/manifest/hls_playlist/*" do |env|
       raw_params = {} of String => Array(String)
       path.each_slice(2) do |pair|
         key, value = pair
-        value = URI.unescape(value)
+        value = URI.decode_www_form(value)
 
         if raw_params[key]?
           raw_params[key] << value
@@ -1479,7 +1499,7 @@ get "/videoplayback/*" do |env|
   raw_params = {} of String => Array(String)
   path.each_slice(2) do |pair|
     key, value = pair
-    value = URI.unescape(value)
+    value = URI.decode_www_form(value)
 
     if raw_params[key]?
       raw_params[key] << value
@@ -1653,7 +1673,7 @@ get "/videoplayback" do |env|
 
             if title = query_params["title"]?
               # https://blog.fastmail.com/2011/06/24/download-non-english-filenames/
-              env.response.headers["Content-Disposition"] = "attachment; filename=\"#{URI.escape(title)}\"; filename*=UTF-8''#{URI.escape(title)}"
+              env.response.headers["Content-Disposition"] = "attachment; filename=\"#{URI.encode_www_form(title)}\"; filename*=UTF-8''#{URI.encode_www_form(title)}"
             end
 
             if !response.headers.includes_word?("Transfer-Encoding", "chunked")
@@ -1899,4 +1919,6 @@ add_context_storage_type(Preferences)
 add_context_storage_type(User)
 
 Kemal.config.logger = logger
+Kemal.config.host_binding = Kemal.config.host_binding != "0.0.0.0" ? Kemal.config.host_binding : CONFIG.host_binding
+Kemal.config.port = Kemal.config.port != 3000 ? Kemal.config.port : CONFIG.port
 Kemal.run

@@ -21,7 +21,7 @@ end
 
 class Kemal::RouteHandler
   {% for method in %w(GET POST PUT HEAD DELETE PATCH OPTIONS) %}
-  exclude ["/api/v1/*"], {{method}}
+    exclude ["/api/v1/*"], {{method}}
   {% end %}
 
   # Processes the route if it's a match. Otherwise renders 404.
@@ -33,8 +33,7 @@ class Kemal::RouteHandler
       raise Kemal::Exceptions::CustomException.new(context)
     end
 
-    if context.request.method == "HEAD" &&
-       context.request.path.ends_with? ".jpg"
+    if context.request.method == "HEAD" && context.request.path.ends_with? ".jpg"
       context.response.headers["Content-Type"] = "image/jpeg"
     end
 
@@ -45,7 +44,7 @@ end
 
 class Kemal::ExceptionHandler
   {% for method in %w(GET POST PUT HEAD DELETE PATCH OPTIONS) %}
-  exclude ["/api/v1/*"], {{method}}
+    exclude ["/api/v1/*"], {{method}}
   {% end %}
 
   private def call_exception_with_status_code(context : HTTP::Server::Context, exception : Exception, status_code : Int32)
@@ -123,7 +122,7 @@ class APIHandler < Kemal::Handler
           end
         end
 
-        if env.params.query["pretty"]? && env.params.query["pretty"] == "1"
+        if env.params.query["pretty"]?.try &.== "1"
           response = response.to_pretty_json
         else
           response = response.to_json
@@ -132,6 +131,18 @@ class APIHandler < Kemal::Handler
         response = env.response.output.gets_to_end
       end
     rescue ex
+      env.response.content_type = "application/json" if env.response.headers.includes_word?("Content-Type", "text/html")
+      env.response.status_code = 500
+
+      if env.response.headers.includes_word?("Content-Type", "application/json")
+        response = {"error" => ex.message || "Unspecified error"}
+
+        if env.params.query["pretty"]?.try &.== "1"
+          response = response.to_pretty_json
+        else
+          response = response.to_json
+        end
+      end
     ensure
       env.response.output = output
       env.response.puts response
@@ -178,40 +189,15 @@ class HTTP::Client
   end
 end
 
-# https://github.com/will/crystal-pg/pull/171
-class PG::Statement < ::DB::Statement
-  protected def perform_query(args : Enumerable) : ResultSet
-    params = args.map { |arg| PQ::Param.encode(arg) }
-    conn = self.conn
-    conn.send_parse_message(@sql)
-    conn.send_bind_message params
-    conn.send_describe_portal_message
-    conn.send_execute_message
-    conn.send_sync_message
-    conn.expect_frame PQ::Frame::ParseComplete
-    conn.expect_frame PQ::Frame::BindComplete
-    frame = conn.read
-    case frame
-    when PQ::Frame::RowDescription
-      fields = frame.fields
-    when PQ::Frame::NoData
-      fields = nil
-    else
-      raise "expected RowDescription or NoData, got #{frame}"
-    end
-    ResultSet.new(self, fields)
-  rescue IO::Error
-    raise DB::ConnectionLost.new(connection)
-  end
+struct Crystal::ThreadLocalValue(T)
+  @values = Hash(Thread, T).new
 
-  protected def perform_exec(args : Enumerable) : ::DB::ExecResult
-    result = perform_query(args)
-    result.each { }
-    ::DB::ExecResult.new(
-      rows_affected: result.rows_affected,
-      last_insert_id: 0_i64 # postgres doesn't support this
-    )
-  rescue IO::Error
-    raise DB::ConnectionLost.new(connection)
+  def get(&block : -> T)
+    th = Thread.current
+    if !@values[th]?
+      @values[th] = yield
+    else
+      @values[th]
+    end
   end
 end
