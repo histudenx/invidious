@@ -78,6 +78,7 @@ LOCALES = {
   "tr"    => load_locale("tr"),
   "uk"    => load_locale("uk"),
   "zh-CN" => load_locale("zh-CN"),
+  "zh-TW" => load_locale("zh-TW"),
 }
 
 config = CONFIG
@@ -116,8 +117,6 @@ Kemal::CLI.new ARGV
 statistics = {
   "error" => "Statistics are not availabile.",
 }
-
-proxies = PROXY_LIST
 
 decrypt_function = [] of {name: String, value: Int32}
 spawn do
@@ -1887,27 +1886,6 @@ error 500 do |env|
 
   error_message = "500 Server Error"
   {"error" => error_message}.to_json
-end
-
-# Add redirect if SSL is enabled
-if Kemal.config.ssl
-  spawn do
-    server = HTTP::Server.new do |env|
-      redirect_url = "https://#{env.request.host}#{env.request.path}"
-      if env.request.query
-        redirect_url += "?#{env.request.query}"
-      end
-
-      if config.hsts
-        env.response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
-      end
-      env.response.headers["Location"] = redirect_url
-      env.response.status_code = 301
-    end
-
-    server.bind_tcp "0.0.0.0", 80
-    server.listen
-  end
 end
 
 Kemal.config.powered_by_header = false
