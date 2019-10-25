@@ -110,7 +110,8 @@ class APIHandler < Kemal::Handler
 
       env.response.output.rewind
 
-      if env.response.headers.includes_word?("Content-Type", "application/json")
+      if env.response.output.as(IO::Memory).size != 0 &&
+         env.response.headers.includes_word?("Content-Type", "application/json")
         response = JSON.parse(env.response.output)
 
         if fields_text = env.params.query["fields"]?
@@ -145,7 +146,7 @@ class APIHandler < Kemal::Handler
       end
     ensure
       env.response.output = output
-      env.response.puts response
+      env.response.print response
 
       env.response.flush
     end
