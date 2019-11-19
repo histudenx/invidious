@@ -24,6 +24,7 @@ require "sqlite3"
 require "xml"
 require "yaml"
 require "zip"
+require "protodec/utils"
 require "./invidious/helpers/*"
 require "./invidious/*"
 
@@ -72,6 +73,7 @@ LOCALES = {
   "fr"    => load_locale("fr"),
   "is"    => load_locale("is"),
   "it"    => load_locale("it"),
+  "ja"    => load_locale("ja"),
   "nb_NO" => load_locale("nb_NO"),
   "nl"    => load_locale("nl"),
   "pl"    => load_locale("pl"),
@@ -82,7 +84,7 @@ LOCALES = {
   "zh-TW" => load_locale("zh-TW"),
 }
 
-YT_POOL     = HTTPPool.new(YT_URL, capacity: CONFIG.pool_size, timeout: 0.05)
+YT_POOL     = QUICPool.new(YT_URL, capacity: CONFIG.pool_size, timeout: 0.05)
 YT_IMG_POOL = HTTPPool.new(YT_IMG_URL, capacity: CONFIG.pool_size, timeout: 0.05)
 
 config = CONFIG
@@ -127,6 +129,20 @@ decrypt_function = [] of {name: String, value: Int32}
 spawn do
   update_decrypt_function do |function|
     decrypt_function = function
+  end
+end
+
+if CONFIG.captcha_key
+  spawn do
+    bypass_captcha(CONFIG.captcha_key, logger) do |cookies|
+      cookies.each do |cookie|
+        config.cookies << cookie
+      end
+
+      # Persist cookies between runs
+      CONFIG.cookies = config.cookies
+      File.write("config/config.yml", config.to_yaml)
+    end
   end
 end
 
@@ -175,7 +191,7 @@ get "/api/v1/storyboards/:id" do |env|
   region = env.params.query["region"]?
 
   begin
-    video = fetch_video(id, region)
+    video = fetch_video(id, region: region)
   rescue ex : VideoRedirect
     error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
     env.response.status_code = 302
@@ -262,7 +278,7 @@ get "/api/v1/captions/:id" do |env|
   # getting video info.
 
   begin
-    video = fetch_video(id, region)
+    video = fetch_video(id, region: region)
   rescue ex : VideoRedirect
     error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
     env.response.status_code = 302
@@ -513,7 +529,13 @@ get "/api/v1/annotations/:id" do |env|
     annotations = response.body
   end
 
-  annotations
+  etag = sha256(annotations)[0, 16]
+  if env.request.headers["If-None-Match"]?.try &.== etag
+    env.response.status_code = 304
+  else
+    env.response.headers["ETag"] = etag
+    annotations
+  end
 end
 
 get "/api/v1/videos/:id" do |env|
@@ -525,7 +547,7 @@ get "/api/v1/videos/:id" do |env|
   region = env.params.query["region"]?
 
   begin
-    video = fetch_video(id, region)
+    video = fetch_video(id, region: region)
   rescue ex : VideoRedirect
     error_message = {"error" => "Video is unavailable", "videoId" => ex.video_id}.to_json
     env.response.status_code = 302
@@ -918,8 +940,9 @@ get "/api/v1/search/suggestions" do |env|
   query ||= ""
 
   begin
-    client = make_client(URI.parse("https://suggestqueries.google.com"))
-    response = client.get("/complete/search?hl=en&gl=#{region}&client=youtube&ds=yt&q=#{URI.encode_www_form(query)}&callback=suggestCallback").body
+    response = QUIC::Client.get(
+      "https://suggestqueries.google.com/complete/search?hl=en&gl=#{region}&client=youtube&ds=yt&q=#{URI.encode_www_form(query)}&callback=suggestCallback"
+    ).body
 
     body = response[35..-2]
     body = JSON.parse(body).as_a
@@ -944,57 +967,55 @@ get "/api/v1/search/suggestions" do |env|
   end
 end
 
-{"/api/v1/playlists/:plid", "/api/v1/auth/playlists/:plid"}.each do |route|
-  get route do |env|
-    locale = LOCALES[env.get("preferences").as(Preferences).locale]?
+get "/api/v1/playlists/:plid" do |env|
+  locale = LOCALES[env.get("preferences").as(Preferences).locale]?
 
-    env.response.content_type = "application/json"
-    plid = env.params.url["plid"]
+  env.response.content_type = "application/json"
+  plid = env.params.url["plid"]
 
-    offset = env.params.query["index"]?.try &.to_i?
-    offset ||= env.params.query["page"]?.try &.to_i?.try { |page| (page - 1) * 100 }
-    offset ||= 0
+  offset = env.params.query["index"]?.try &.to_i?
+  offset ||= env.params.query["page"]?.try &.to_i?.try { |page| (page - 1) * 100 }
+  offset ||= 0
 
-    continuation = env.params.query["continuation"]?
+  continuation = env.params.query["continuation"]?
 
-    format = env.params.query["format"]?
-    format ||= "json"
+  format = env.params.query["format"]?
+  format ||= "json"
 
-    if plid.starts_with? "RD"
-      next env.redirect "/api/v1/mixes/#{plid}"
-    end
-
-    begin
-      playlist = fetch_playlist(plid, locale)
-    rescue ex
-      env.response.status_code = 404
-      error_message = {"error" => "Playlist does not exist."}.to_json
-      next error_message
-    end
-
-    user = env.get?("user").try &.as(User)
-    if !playlist || playlist.privacy.private? && playlist.author != user.try &.email
-      env.response.status_code = 404
-      error_message = {"error" => "Playlist does not exist."}.to_json
-      next error_message
-    end
-
-    response = playlist.to_json(offset, locale, config, Kemal.config, continuation: continuation)
-
-    if format == "html"
-      response = JSON.parse(response)
-      playlist_html = template_playlist(response)
-      index, next_video = response["videos"].as_a.skip(1).select { |video| !video["author"].as_s.empty? }[0]?.try { |v| {v["index"], v["videoId"]} } || {nil, nil}
-
-      response = {
-        "playlistHtml" => playlist_html,
-        "index"        => index,
-        "nextVideo"    => next_video,
-      }.to_json
-    end
-
-    response
+  if plid.starts_with? "RD"
+    next env.redirect "/api/v1/mixes/#{plid}"
   end
+
+  begin
+    playlist = fetch_playlist(plid, locale)
+  rescue ex
+    env.response.status_code = 404
+    error_message = {"error" => "Playlist does not exist."}.to_json
+    next error_message
+  end
+
+  user = env.get?("user").try &.as(User)
+  if !playlist || playlist.privacy.private? && playlist.author != user.try &.email
+    env.response.status_code = 404
+    error_message = {"error" => "Playlist does not exist."}.to_json
+    next error_message
+  end
+
+  response = playlist.to_json(offset, locale, config, Kemal.config, continuation: continuation)
+
+  if format == "html"
+    response = JSON.parse(response)
+    playlist_html = template_playlist(response)
+    index, next_video = response["videos"].as_a.skip(1).select { |video| !video["author"].as_s.empty? }[0]?.try { |v| {v["index"], v["videoId"]} } || {nil, nil}
+
+    response = {
+      "playlistHtml" => playlist_html,
+      "index"        => index,
+      "nextVideo"    => next_video,
+    }.to_json
+  end
+
+  response
 end
 
 get "/api/v1/mixes/:rdid" do |env|
@@ -1432,7 +1453,7 @@ get "/videoplayback" do |env|
 
   client = make_client(URI.parse(host), region)
 
-  response = HTTP::Client::Response.new(403)
+  response = HTTP::Client::Response.new(500)
   5.times do
     begin
       response = client.head(url, headers)
@@ -1693,6 +1714,36 @@ get "/s_p/:id/:name" do |env|
 
   begin
     client.get(url, headers) do |response|
+      env.response.status_code = response.status_code
+      response.headers.each do |key, value|
+        if !RESPONSE_HEADERS_BLACKLIST.includes? key
+          env.response.headers[key] = value
+        end
+      end
+
+      env.response.headers["Access-Control-Allow-Origin"] = "*"
+
+      if response.status_code >= 300 && response.status_code != 404
+        env.response.headers.delete("Transfer-Encoding")
+        break
+      end
+
+      proxy_file(response, env)
+    end
+  rescue ex
+  end
+end
+
+get "/yts/img/:name" do |env|
+  headers = HTTP::Headers.new
+  REQUEST_HEADERS_WHITELIST.each do |header|
+    if env.request.headers[header]?
+      headers[header] = env.request.headers[header]
+    end
+  end
+
+  begin
+    YT_POOL.client &.get(env.request.resource, headers) do |response|
       env.response.status_code = response.status_code
       response.headers.each do |key, value|
         if !RESPONSE_HEADERS_BLACKLIST.includes? key

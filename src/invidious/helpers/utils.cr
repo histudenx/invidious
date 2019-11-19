@@ -1,4 +1,15 @@
+require "lsquic"
 require "pool/connection"
+
+def add_yt_headers(request)
+  request.headers["x-youtube-client-name"] ||= "1"
+  request.headers["x-youtube-client-version"] ||= "1.20180719"
+  request.headers["user-agent"] ||= "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.97 Safari/537.36"
+  request.headers["accept-charset"] ||= "ISO-8859-1,utf-8;q=0.7,*;q=0.7"
+  request.headers["accept"] ||= "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+  request.headers["accept-language"] ||= "en-us,en;q=0.5"
+  request.headers["cookie"] = "#{(CONFIG.cookies.map { |c| "#{c.name}=#{c.value}" }).join("; ")}; #{request.headers["cookie"]?}"
+end
 
 struct HTTPPool
   property! url : URI
@@ -12,7 +23,9 @@ struct HTTPPool
   end
 
   def client(region = nil, &block)
-    pool.connection do |conn|
+    conn = pool.checkout
+
+    begin
       if region
         PROXY_LIST[region]?.try &.sample(40).each do |proxy|
           begin
@@ -25,18 +38,72 @@ struct HTTPPool
       end
 
       response = yield conn
-      conn.unset_proxy
+
+      if region
+        conn.unset_proxy
+      end
+
       response
+    rescue ex
+      conn = HTTPClient.new(url)
+      conn.before_request { |r| add_yt_headers(r) } if url.host == "www.youtube.com"
+      conn.family = (url.host == "www.youtube.com" || url.host == "suggestqueries.google.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
+      conn.read_timeout = 10.seconds
+      conn.connect_timeout = 10.seconds
+      yield conn
+    ensure
+      pool.checkin(conn)
     end
   end
 
   private def build_pool
     ConnectionPool(HTTPClient).new(capacity: capacity, timeout: timeout) do
       client = HTTPClient.new(url)
-      client.family = (url.host == "www.youtube.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
-      client.read_timeout = 5.seconds
-      client.connect_timeout = 5.seconds
+      client.before_request { |r| add_yt_headers(r) } if url.host == "www.youtube.com"
+      client.family = (url.host == "www.youtube.com" || url.host == "suggestqueries.google.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
+      client.read_timeout = 10.seconds
+      client.connect_timeout = 10.seconds
       client
+    end
+  end
+end
+
+struct QUICPool
+  property! url : URI
+  property! capacity : Int32
+  property! timeout : Float64
+
+  def initialize(url : URI, @capacity = 5, @timeout = 5.0)
+    @url = url
+  end
+
+  def client(region = nil, &block)
+    begin
+      if region
+        client = HTTPClient.new(url)
+        client.before_request { |r| add_yt_headers(r) } if url.host == "www.youtube.com"
+        client.read_timeout = 10.seconds
+        client.connect_timeout = 10.seconds
+
+        PROXY_LIST[region]?.try &.sample(40).each do |proxy|
+          begin
+            proxy = HTTPProxy.new(proxy_host: proxy[:ip], proxy_port: proxy[:port])
+            client.set_proxy(proxy)
+            break
+          rescue ex
+          end
+        end
+
+        yield client
+      else
+        conn = QUIC::Client.new(url)
+        conn.before_request { |r| add_yt_headers(r) } if url.host == "www.youtube.com"
+        yield conn
+      end
+    rescue ex
+      conn = QUIC::Client.new(url)
+      conn.before_request { |r| add_yt_headers(r) } if url.host == "www.youtube.com"
+      yield conn
     end
   end
 end
@@ -64,8 +131,8 @@ end
 def make_client(url : URI, region = nil)
   client = HTTPClient.new(url)
   client.family = (url.host == "www.youtube.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
-  client.read_timeout = 5.seconds
-  client.connect_timeout = 5.seconds
+  client.read_timeout = 10.seconds
+  client.connect_timeout = 10.seconds
 
   if region
     PROXY_LIST[region]?.try &.sample(40).each do |proxy|
@@ -82,7 +149,7 @@ def make_client(url : URI, region = nil)
 end
 
 def decode_length_seconds(string)
-  length_seconds = string.split(":").map { |a| a.to_i }
+  length_seconds = string.gsub(/[^0-9:]/, "").split(":").map &.to_i
   length_seconds = [0] * (3 - length_seconds.size) + length_seconds
   length_seconds = Time::Span.new(length_seconds[0], length_seconds[1], length_seconds[2])
   length_seconds = length_seconds.total_seconds.to_i
@@ -352,7 +419,7 @@ def sha256(text)
   return digest.hexdigest
 end
 
-def subscribe_pubsub(topic, key, config)
+def subscribe_pubsub(topic, key, config, client_pool)
   case topic
   when .match(/^UC[A-Za-z0-9_-]{22}$/)
     topic = "channel_id=#{topic}"
@@ -364,7 +431,6 @@ def subscribe_pubsub(topic, key, config)
     # TODO
   end
 
-  client = make_client(PUBSUB_URL)
   time = Time.utc.to_unix.to_s
   nonce = Random::Secure.hex(4)
   signature = "#{time}:#{nonce}"
@@ -380,7 +446,7 @@ def subscribe_pubsub(topic, key, config)
     "hub.secret"        => key.to_s,
   }
 
-  return client.post("/subscribe", form: body)
+  return client_pool.client &.post("/subscribe", form: body)
 end
 
 def parse_range(range)
